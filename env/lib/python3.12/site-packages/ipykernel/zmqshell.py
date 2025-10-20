@@ -14,11 +14,13 @@ machinery.  This should thus be thought of as scaffolding.
 # Copyright (c) IPython Development Team.
 # Distributed under the terms of the Modified BSD License.
 
+import contextvars
 import os
 import sys
+import threading
+import typing
 import warnings
 from pathlib import Path
-from threading import local
 
 from IPython.core import page
 from IPython.core.autocall import ZMQExitAutocall
@@ -33,7 +35,7 @@ from IPython.utils import openpy
 from IPython.utils.process import arg_split, system  # type:ignore[attr-defined]
 from jupyter_client.session import Session, extract_header
 from jupyter_core.paths import jupyter_runtime_dir
-from traitlets import Any, CBool, CBytes, Dict, Instance, Type, default, observe
+from traitlets import Any, CBool, CBytes, Instance, Type, default, observe
 
 from ipykernel import connect_qtconsole, get_connection_file, get_connection_info
 from ipykernel.displayhook import ZMQShellDisplayHook
@@ -49,7 +51,7 @@ class ZMQDisplayPublisher(DisplayPublisher):
 
     session = Instance(Session, allow_none=True)
     pub_socket = Any(allow_none=True)
-    parent_header = Dict({})
+    _parent_header: contextvars.ContextVar[dict[str, Any]]
     topic = CBytes(b"display_data")
 
     # thread_local:
@@ -57,9 +59,18 @@ class ZMQDisplayPublisher(DisplayPublisher):
     # is processed. See ipykernel Issue 113 for a discussion.
     _thread_local = Any()
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._parent_header = contextvars.ContextVar("parent_header")
+        self._parent_header.set({})
+
+    @property
+    def parent_header(self):
+        return self._parent_header.get()
+
     def set_parent(self, parent):
         """Set the parent for outbound messages."""
-        self.parent_header = extract_header(parent)
+        self._parent_header.set(extract_header(parent))
 
     def _flush_streams(self):
         """flush IO Streams prior to display"""
@@ -69,7 +80,7 @@ class ZMQDisplayPublisher(DisplayPublisher):
     @default("_thread_local")
     def _default_thread_local(self):
         """Initialize our thread local storage"""
-        return local()
+        return threading.local()
 
     @property
     def _hooks(self):
@@ -78,12 +89,16 @@ class ZMQDisplayPublisher(DisplayPublisher):
             self._thread_local.hooks = []
         return self._thread_local.hooks
 
-    def publish(
+    # Feb: 2025 IPython has a deprecated, `source` parameter, marked for removal that
+    # triggers typing errors.
+    def publish(  # type:ignore[override]
         self,
         data,
         metadata=None,
+        *,
         transient=None,
         update=False,
+        **kwargs,
     ):
         """Publish a display-data message
 
@@ -125,7 +140,7 @@ class ZMQDisplayPublisher(DisplayPublisher):
         for hook in self._hooks:
             msg = hook(msg)
             if msg is None:
-                return  # type:ignore[unreachable]
+                return
 
         self.session.send(
             self.pub_socket,
@@ -153,7 +168,7 @@ class ZMQDisplayPublisher(DisplayPublisher):
         for hook in self._hooks:
             msg = hook(msg)
             if msg is None:
-                return  # type:ignore[unreachable]
+                return
 
         self.session.send(
             self.pub_socket,
@@ -398,14 +413,6 @@ class KernelMagics(Magics):
         Useful for connecting a qtconsole to running notebooks, for better
         debugging.
         """
-
-        # %qtconsole should imply bind_kernel for engines:
-        # FIXME: move to ipyparallel Kernel subclass
-        if "ipyparallel" in sys.modules:
-            from ipyparallel import bind_kernel
-
-            bind_kernel()
-
         try:
             connect_qtconsole(argv=arg_split(arg_s, os.name == "posix"))
         except Exception as e:
@@ -439,15 +446,63 @@ class KernelMagics(Magics):
         else:
             print("Autosave disabled")
 
+    @line_magic
+    def subshell(self, arg_s):
+        """
+        List all current subshells
+        """
+        from ipykernel.kernelapp import IPKernelApp
+
+        if not IPKernelApp.initialized():
+            msg = "Not in a running Kernel"
+            raise RuntimeError(msg)
+
+        app = IPKernelApp.instance()
+        kernel = app.kernel
+
+        if not getattr(kernel, "_supports_kernel_subshells", False):
+            print("Kernel does not support subshells")
+            return
+
+        thread_id = threading.current_thread().ident
+        manager = kernel.shell_channel_thread.manager
+        try:
+            subshell_id = manager.subshell_id_from_thread_id(thread_id)
+        except RuntimeError:
+            subshell_id = "unknown"
+        subshell_id_list = manager.list_subshell()
+
+        print(f"subshell id: {subshell_id}")
+        print(f"thread id: {thread_id}")
+        print(f"main thread id: {threading.main_thread().ident}")
+        print(f"pid: {os.getpid()}")
+        print(f"thread count: {threading.active_count()}")
+        print(f"subshell list: {subshell_id_list}")
+
 
 class ZMQInteractiveShell(InteractiveShell):
     """A subclass of InteractiveShell for ZMQ."""
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+        # tqdm has an incorrect detection of ZMQInteractiveShell when launch via
+        # a scheduler that bypass IPKernelApp Think of JupyterHub cluster
+        # spawners and co. as of end of Feb 2025, the maintainer has been
+        # unresponsive for 5 months, to our fix, so we implement a workaround. I
+        # don't like it but we have few other choices.
+        # See https://github.com/tqdm/tqdm/pull/1628
+        if "IPKernelApp" not in self.config:
+            self.config.IPKernelApp.tqdm = "dummy value for https://github.com/tqdm/tqdm/pull/1628"
+
+        self._parent_header = contextvars.ContextVar("parent_header")
+        self._parent_header.set({})
+
     displayhook_class = Type(ZMQShellDisplayHook)
     display_pub_class = Type(ZMQDisplayPublisher)
-    data_pub_class = Any()  # type:ignore[assignment]
+    data_pub_class = Any()
     kernel = Any()
-    parent_header = Any()
+    _parent_header: contextvars.ContextVar[dict[str, Any]]
 
     @default("banner1")
     def _default_banner1(self):
@@ -483,7 +538,7 @@ class ZMQInteractiveShell(InteractiveShell):
 
     # Over ZeroMQ, GUI control isn't done with PyOS_InputHook as there is no
     # interactive input being read; we provide event loop support in ipkernel
-    def enable_gui(self, gui):
+    def enable_gui(self, gui: typing.Any = None) -> None:
         """Enable a given guil."""
         from .eventloops import enable_gui as real_enable_gui
 
@@ -553,7 +608,7 @@ class ZMQInteractiveShell(InteractiveShell):
                 stacklevel=2,
             )
 
-            self._data_pub = self.data_pub_class(parent=self)  # type:ignore[has-type]
+            self._data_pub = self.data_pub_class(parent=self)
             self._data_pub.session = self.display_pub.session  # type:ignore[attr-defined]
             self._data_pub.pub_socket = self.display_pub.pub_socket  # type:ignore[attr-defined]
         return self._data_pub
@@ -616,21 +671,21 @@ class ZMQInteractiveShell(InteractiveShell):
         )
         self.payload_manager.write_payload(payload)  # type:ignore[union-attr]
 
+    @property
+    def parent_header(self):
+        return self._parent_header.get()
+
     def set_parent(self, parent):
         """Set the parent header for associating output with its triggering input"""
-        self.parent_header = parent
+        self._parent_header.set(parent)
         self.displayhook.set_parent(parent)  # type:ignore[attr-defined]
         self.display_pub.set_parent(parent)  # type:ignore[attr-defined]
         if hasattr(self, "_data_pub"):
             self.data_pub.set_parent(parent)
-        try:
-            sys.stdout.set_parent(parent)  # type:ignore[attr-defined]
-        except AttributeError:
-            pass
-        try:
-            sys.stderr.set_parent(parent)  # type:ignore[attr-defined]
-        except AttributeError:
-            pass
+        if hasattr(sys.stdout, "set_parent"):
+            sys.stdout.set_parent(parent)
+        if hasattr(sys.stderr, "set_parent"):
+            sys.stderr.set_parent(parent)
 
     def get_parent(self):
         """Get the parent header."""
